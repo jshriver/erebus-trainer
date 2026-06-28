@@ -8,6 +8,7 @@ use bullet_lib::{
         TrainingDataEntry,
     },
     game::inputs,
+    game::outputs,
     nn::optimiser,
     trainer::{
         save::SavedFormat,
@@ -196,20 +197,18 @@ fn main() {
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(optimiser::AdamW)
-        .inputs(inputs::ChessBuckets {
-            buckets: [
-                0, 1, 2, 3, 3, 2, 1, 0,
-                4, 5, 6, 7, 7, 6, 5, 4,
-                8, 8, 8, 8, 8, 8, 8, 8,
-                9, 9, 9, 9, 9, 9, 9, 9,
-                9, 9, 9, 9, 9, 9, 9, 9,
-                9, 9, 9, 9, 9, 9, 9, 9,
-                9, 9, 9, 9, 9, 9, 9, 9,
-                9, 9, 9, 9, 9, 9, 9, 9,
-            ],
-        })
-        .output_buckets(OUTPUT_BUCKETS)
-        .use_devices(vec![()])
+        .inputs(inputs::ChessBuckets::new([
+            0, 1, 2, 3, 3, 2, 1, 0,
+            4, 5, 6, 7, 7, 6, 5, 4,
+            8, 8, 8, 8, 8, 8, 8, 8,
+            9, 9, 9, 9, 9, 9, 9, 9,
+            9, 9, 9, 9, 9, 9, 9, 9,
+            9, 9, 9, 9, 9, 9, 9, 9,
+            9, 9, 9, 9, 9, 9, 9, 9,
+            9, 9, 9, 9, 9, 9, 9, 9,
+        ]))
+        .output_buckets(outputs::MaterialCount::<OUTPUT_BUCKETS>)
+        .use_device(0)
         .save_format(&[
             SavedFormat::id("l0w").round().quantise::<i16>(QA),
             SavedFormat::id("l0b").round().quantise::<i16>(QA),
