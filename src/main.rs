@@ -220,16 +220,30 @@ fn main() {
             SavedFormat::id("l3b"),
         ])
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
-        .build(|builder, stm_inputs, ntm_inputs| {
+        .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0 = builder.new_affine("l0", 768 * INPUT_BUCKETS, L1_SIZE);
-            let l1 = builder.new_affine("l1", 2 * L1_SIZE, L2_SIZE);
+            // l1 fans out to L2_SIZE * OUTPUT_BUCKETS -- bucket-specialised right
+            // after the FT, at the layer doing the heaviest compression (4096->32).
+            // Confirmed via Colab smoke test (select() chained mid-pipeline, followed
+            // by further forward()/screlu() calls, trained one superbatch cleanly with
+            // finite loss) that this composes correctly -- not just a terminal-only op
+            // as bullet's own example demonstrates it.
+            let l1 = builder.new_affine("l1", 2 * L1_SIZE, L2_SIZE * OUTPUT_BUCKETS);
+            // l2/l3 remain fully shared across all output buckets -- bullet has no
+            // built-in mechanism for full per-bucket replication of these layers
+            // (confirmed: new_affine_custom's extra param is bias_cols, not a bucket
+            // count). Bucketing only at l1 concentrates the specialization where it
+            // has the most leverage rather than spreading it thin.
             let l2 = builder.new_affine("l2", L2_SIZE, L3_SIZE);
             let l3 = builder.new_affine("l3", L3_SIZE, 1);
 
             let stm_hidden = l0.forward(stm_inputs).screlu();
             let ntm_hidden = l0.forward(ntm_inputs).screlu();
             let hidden = stm_hidden.concat(ntm_hidden);
-            let out1 = l1.forward(hidden).screlu();
+
+            let l1_out = l1.forward(hidden);             // shape: L2_SIZE * OUTPUT_BUCKETS
+            let selected = l1_out.select(output_buckets); // shape: L2_SIZE, bucket-specific
+            let out1 = selected.screlu();
             let out2 = l2.forward(out1).screlu();
             l3.forward(out2)
         });
