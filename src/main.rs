@@ -64,27 +64,27 @@ const QB: i16 = 64;
 // headroom. Getting this wrong fails as a CUDA OOM crash mid-session,
 // which is expensive to discover on a metered, session-limited resource.
 // ============================================================
-const BATCHES_PER_SUPERBATCH: usize = 1_000;
-const BATCH_SIZE: usize = 8_192; // SMOKE-TEST THIS before a long run.
+const BATCHES_PER_SUPERBATCH: usize = 18_000;
+const BATCH_SIZE: usize = 8_192; 
 
 // ============================================================
 // Fixed global training budget.
 //
-// THIS IS THE FIX for the cross-session LR schedule bug: TOTAL_POSITIONS_TARGET
-// and the superbatch count derived from it are FIXED CONSTANTS, computed the
-// same way every time this binary is invoked -- they do NOT depend on which
-// binpack chunk this particular session happens to be loading, or how big
-// that chunk is. This is what CosineDecayLR's `final_superbatch` anchors to,
-// so the LR curve is consistent across the whole multi-month, many-session
-// run instead of silently resetting its notion of "near the end" every time
-// you restart on a new binpack file.
+// TOTAL_POSITIONS_TARGET and the superbatch count derived from it are
+// FIXED CONSTANTS, computed the same way every time this binary is
+// invoked -- they do NOT depend on which binpack chunk this particular
+// session happens to be loading, or how big that chunk is. This is what
+// CosineDecayLR's `final_superbatch` anchors to, so the LR curve is
+// consistent across the whole multi-month, many-session run instead of
+// silently resetting its notion of "near the end" every time you restart
+// on a new binpack file.
 //
 // 300B positions, as discussed. Update this constant only if your total
 // planned data budget actually changes -- and if you do change it mid-run,
 // understand that it reshapes the whole remaining LR curve, not just the
 // tail end.
 // ============================================================
-const TOTAL_POSITIONS_TARGET: usize = 300_000_000_000;
+const TOTAL_POSITIONS_TARGET: usize = 70_000_000_000;
 
 fn total_planned_superbatches() -> usize {
     let total_batches = TOTAL_POSITIONS_TARGET / BATCH_SIZE;
@@ -128,9 +128,9 @@ fn filter(entry: &TrainingDataEntry) -> bool {
 
 // ============================================================
 // Estimate how many superbatches this SESSION's binpack covers.
-// This is now used ONLY to compute end_superbatch for this invocation
+// This is used ONLY to compute end_superbatch for this invocation
 // (i.e. where to stop and checkpoint) -- it is NOT used to anchor the
-// LR schedule anymore. That's the whole point of the fix.
+// LR schedule. That's what total_planned_superbatches() is for.
 // ============================================================
 fn positions_in_one_pass(file_path: &str) -> usize {
     let file_size = fs::metadata(file_path)
@@ -247,6 +247,28 @@ fn main() {
             let out2 = l2.forward(out1).screlu();
             l3.forward(out2)
         });
+
+    // ============================================================
+    // Resume from previous checkpoint, if one exists.
+    //
+    // THIS IS THE FIX. Without this call, `trainer` above is always a
+    // freshly-initialized network -- start_superbatch/end_superbatch only
+    // fed the LR schedule's bookkeeping, they never touched the weights.
+    // load_from_checkpoint() restores both the network weights AND the
+    // optimiser state (AdamW moments) from `{path}/optimiser_state`,
+    // matching the directory layout save_to_checkpoint() writes (verified
+    // against bullet's source: crates/bullet_lib/src/value/save.rs).
+    // It exits the process loudly on failure rather than silently
+    // continuing with fresh weights, which is what you want for a
+    // metered, multi-session run.
+    // ============================================================
+    if start_superbatch > 1 {
+        let checkpoint_path = format!("{}/{}-{}", output_dir, net_id, start_superbatch - 1);
+        println!("Resuming: loading weights + optimiser state from {}", checkpoint_path);
+        trainer.load_from_checkpoint(&checkpoint_path);
+    } else {
+        println!("No existing checkpoint found -- starting from fresh initialization.");
+    }
 
     // ============================================================
     // Learning rate schedule -- CosineDecayLR, anchored to the FIXED
