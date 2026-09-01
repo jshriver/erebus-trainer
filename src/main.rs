@@ -86,7 +86,8 @@ const QB: i16 = 64;
 const BATCHES_PER_SUPERBATCH: usize = 18_000;
 const BATCH_SIZE: usize = 8_192;
 
-const TOTAL_POSITIONS_TARGET: usize = 218_849_949_380;
+// const TOTAL_POSITIONS_TARGET: usize = 218_849_949_380;  // actual # of positions in the BT4 dataset
+const TOTAL_POSITIONS_TARGET: usize = 656_849_848_140;  // doing 3 passes per file
 
 fn total_planned_superbatches() -> usize {
     let total_batches = TOTAL_POSITIONS_TARGET / BATCH_SIZE;
