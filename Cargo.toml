@@ -8,3 +8,5 @@ git = "https://github.com/jw1912/bullet.git"
 default-features = false
 features = ["cuda"]
 
+[dependencies]
+bulletformat = "1.8.0"
