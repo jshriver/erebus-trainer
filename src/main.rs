@@ -86,7 +86,7 @@ const QB: i16 = 64;
 const BATCHES_PER_SUPERBATCH: usize = 18_000;
 const BATCH_SIZE: usize = 8_192;
 
-const TOTAL_POSITIONS_TARGET: usize = 70_000_000_000;
+const TOTAL_POSITIONS_TARGET: usize = 218_849_949_380;
 
 fn total_planned_superbatches() -> usize {
     let total_batches = TOTAL_POSITIONS_TARGET / BATCH_SIZE;
