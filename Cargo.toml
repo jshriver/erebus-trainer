@@ -10,3 +10,4 @@ features = ["cuda"]
 
 [dependencies]
 bulletformat = "1.8.0"
+sfbinpack = "0.6"
