@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::File;
 use std::path::Path;
 use std::env;
 
@@ -18,6 +19,7 @@ use bullet_lib::{
     value::{loader, ValueTrainerBuilder},
 };
 use bulletformat::ChessBoard;
+use sfbinpack::CompressedTrainingDataEntryReader;
 
 // ============================================================
 // Network Architecture -- dual accumulator (PST + Threat), Reckless
@@ -86,8 +88,7 @@ const QB: i16 = 64;
 const BATCHES_PER_SUPERBATCH: usize = 18_000;
 const BATCH_SIZE: usize = 8_192;
 
-// const TOTAL_POSITIONS_TARGET: usize = 218_849_949_380;  // actual # of positions in the BT4 dataset
-const TOTAL_POSITIONS_TARGET: usize = 656_849_848_140;  // doing 3 passes per file
+const TOTAL_POSITIONS_TARGET: usize = 218_849_949_380;
 
 fn total_planned_superbatches() -> usize {
     let total_batches = TOTAL_POSITIONS_TARGET / BATCH_SIZE;
@@ -121,16 +122,138 @@ fn filter(entry: &TrainingDataEntry) -> bool {
         && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
 }
 
-fn positions_in_one_pass(file_path: &str) -> usize {
-    let file_size = fs::metadata(file_path)
-        .expect("Could not read binpack file metadata")
-        .len() as usize;
-    let estimated_positions = file_size / 100;
-    let total_batches = estimated_positions / BATCH_SIZE;
+// Known exact position counts, keyed by binpack basename (not full path,
+// so this table survives moving files between /kaggle/input/... mounts
+// across sessions). Add an entry here whenever you count a new file --
+// this is checked first and is instant, no I/O at all.
+//
+// Get the basename+count once (e.g. from your standalone binpack_counter
+// tool's output) and paste it in below.
+//
+// Verified: these 41 files sum to 218,849,949,380 positions, matching the
+// "Complete running total" reported by the download-and-count batch job.
+const KNOWN_POSITION_COUNTS: &[(&str, u64)] = &[
+    ("test60-2021-11-nov-12tb7p.min-v2.relabel-BT4-tf13tune.binpack", 1_452_424_355),
+    ("test60-2021-12-dec-12tb7p.min-v2.relabel-BT4-tf13tune.binpack", 1_363_206_227),
+    ("test77-2021-12-dec-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 6_286_624_013),
+    ("test78-2022-01-to-05-jantomay-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 7_419_909_666),
+    ("test78-2022-06-to-09-juntosep-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 3_574_170_531),
+    ("test79-2022-04-apr-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 2_930_087_205),
+    ("test79-2022-05-may-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 2_284_179_270),
+    ("test80-2022-06-jun-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 4_488_679_928),
+    ("test80-2022-07-jul-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 4_835_573_847),
+    ("test80-2022-08-aug-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 3_801_599_910),
+    ("test80-2022-09-sep-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 4_171_904_814),
+    ("test80-2022-10-oct-16tb7p.v6-dd.relabel-BT4-tf13tune.part_0.binpack", 2_030_804_185),
+    ("test80-2022-10-oct-16tb7p.v6-dd.relabel-BT4-tf13tune.part_1.binpack", 2_030_725_513),
+    ("test80-2022-11-nov-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 4_608_318_891),
+    ("test80-2023-01-jan-16tb7p.v6-sk20.min.relabel-BT4-tf13tune.binpack", 4_707_093_556),
+    ("test80-2023-02-feb-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack", 3_626_845_354),
+    ("test80-2023-03-mar-2tb7p.v6-sk16.min.relabel-BT4-tf13tune.binpack", 5_520_899_664),
+    ("test80-2023-04-apr-2tb7p.v6-sk16.min.relabel-BT4-tf13tune.binpack", 5_653_619_110),
+    ("test80-2023-05-may-2tb7p.v6.min.relabel-BT4-tf13tune.binpack", 5_600_480_538),
+    ("test80-2023-06-jun-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 6_756_356_195),
+    ("test80-2023-07-jul-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 6_212_977_488),
+    ("test80-2023-08-aug-2tb7p.v6.min.relabel-BT4-tf13tune.binpack", 2_693_519_136),
+    ("test80-2023-09-sep-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 3_257_611_143),
+    ("test80-2023-10-oct-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 3_012_783_968),
+    ("test80-2023-11-nov-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 2_724_311_169),
+    ("test80-2023-12-dec-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack", 3_016_184_922),
+    ("leela96-filt-v2.min.split_0.relabel-BT4-tf13tune.binpack", 5_681_356_602),
+    ("leela96-filt-v2.min.split_1.relabel-BT4-tf13tune.binpack", 5_679_303_898),
+    ("leela96-filt-v2.min.split_2.relabel-BT4-tf13tune.binpack", 5_680_096_474),
+    ("leela96-filt-v2.min.split_3.relabel-BT4-tf13tune.binpack", 5_681_363_129),
+    ("leela96-filt-v2.min.split_4.relabel-BT4-tf13tune.binpack", 5_680_919_670),
+    ("T60T70wIsRightFarseerT60T74T75T76.split_0.relabel-BT4-tf13tune.binpack", 9_133_725_682),
+    ("T60T70wIsRightFarseerT60T74T75T76.split_1.relabel-BT4-tf13tune.binpack", 9_150_872_906),
+    ("T60T70wIsRightFarseerT60T74T75T76.split_2.relabel-BT4-tf13tune.binpack", 9_136_446_438),
+    ("T60T70wIsRightFarseerT60T74T75T76.split_3.relabel-BT4-tf13tune.binpack", 9_128_728_654),
+    ("T60T70wIsRightFarseerT60T74T75T76.split_4.relabel-BT4-tf13tune.binpack", 9_160_229_495),
+    ("dfrc_n5000.relabel-BT4-tf13tune.binpack", 12_353_351_142),
+    ("fishpack32.relabel-BT4-tf13tune.binpack", 2_555_358_353),
+    ("multinet_pv-2_diff-100_nodes-5000.relabel-BT4-tf13tune.binpack", 9_485_503_089),
+    ("nodes5000pv2_UHO.relabel-BT4-tf13tune.binpack", 13_937_427_120),
+    ("wrongIsRight_nodes5000pv2.relabel-BT4-tf13tune.binpack", 2_344_376_130),
+];
+
+// Returns the exact number of positions in a binpack.
+//
+// Checks three sources, in order, each faster/staler than the last:
+//   1. KNOWN_POSITION_COUNTS above -- instant, hand-maintained.
+//   2. A cached sidecar file "<binpack>.count" (a single u64) -- instant,
+//      auto-written by this function after any live scan below.
+//   3. A live scan through sfbinpack's own reader -- slow (minutes for a
+//      large file) but always correct; used only when neither of the
+//      above has an answer, so a brand-new file still gets counted
+//      properly instead of silently reusing the old file_size/100 guess
+//      (which was off by ~31x on real data -- see the "9485503089 vs
+//      304M estimated" incident that prompted this whole rewrite).
+//
+// A live scan is I/O-bound, not GPU-bound, but it still burns wall-clock
+// GPU-session time on Kaggle if it runs inside a GPU notebook. Prefer
+// adding to KNOWN_POSITION_COUNTS (or pre-writing the sidecar from the
+// CPU-only notebook) so this path stays a fallback, not the common case.
+fn count_positions(file_path: &str) -> u64 {
+    let basename = Path::new(file_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string());
+
+    if let Some((_, count)) = KNOWN_POSITION_COUNTS.iter().find(|(name, _)| *name == basename) {
+        println!("Position count:      {} (from KNOWN_POSITION_COUNTS)", count);
+        return *count;
+    }
+
+    let sidecar_path = format!("{}.count", file_path);
+    if let Ok(contents) = fs::read_to_string(&sidecar_path) {
+        if let Ok(count) = contents.trim().parse::<u64>() {
+            println!("Position count:      {} (from cached {})", count, sidecar_path);
+            return count;
+        }
+        println!(
+            "WARNING: sidecar {} exists but could not be parsed as u64 -- falling back to a live scan.",
+            sidecar_path
+        );
+    }
+
+    println!("No known/cached count found for '{}' -- scanning binpack for exact position count...", basename);
+    let t0 = std::time::Instant::now();
+
+    let file = File::open(file_path).expect("Could not open binpack file for counting");
+    let mut reader = CompressedTrainingDataEntryReader::new(file)
+        .expect("Could not create sfbinpack reader for counting");
+
+    let mut count: u64 = 0;
+    while reader.has_next() {
+        let _ = reader.next();
+        count += 1;
+    }
+
+    println!("Scan complete: {} positions in {:.1}s", count, t0.elapsed().as_secs_f64());
+    println!(
+        "TIP: add (\"{}\", {}) to KNOWN_POSITION_COUNTS to skip this scan next time.",
+        basename, count
+    );
+
+    // Cache it for next time too, best-effort -- if this fails (e.g.
+    // read-only mount), training still proceeds correctly, it just
+    // re-scans (or you add it to KNOWN_POSITION_COUNTS) next run.
+    if let Err(e) = fs::write(&sidecar_path, count.to_string()) {
+        println!("WARNING: could not write cache {}: {} (will re-scan next run)", sidecar_path, e);
+    }
+
+    count
+}
+
+
+fn superbatches_for_positions(positions: u64, passes: usize) -> usize {
+    let total_positions = positions as usize * passes;
+    let total_batches = total_positions / BATCH_SIZE;
     let superbatches = (total_batches / BATCHES_PER_SUPERBATCH).max(1);
-    println!("File size:                    {}MB", file_size / 1_048_576);
-    println!("Estimated positions:          {}M", estimated_positions / 1_000_000);
-    println!("Estimated superbatches/pass:  {}", superbatches);
+    println!("Positions (this pass):        {}", positions);
+    println!("Passes (session):             {}", passes);
+    println!("Total positions (session):    {}", total_positions);
+    println!("Superbatches (session):       {}", superbatches);
     superbatches
 }
 
@@ -481,7 +604,8 @@ fn main() {
     let output_dir = "checkpoints";
 
     let start_superbatch = find_latest_superbatch(net_id, output_dir);
-    let superbatches_this_session = positions_in_one_pass(file_path) * passes;
+    let position_count = count_positions(file_path);
+    let superbatches_this_session = superbatches_for_positions(position_count, passes);
     let end_superbatch = start_superbatch + superbatches_this_session;
 
     let total_planned = total_planned_superbatches();
