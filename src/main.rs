@@ -4,10 +4,6 @@ use std::path::Path;
 use std::env;
 
 use bullet_lib::{
-    game::formats::sfbinpack::{
-        chess::{piecetype::PieceType, r#move::MoveType},
-        TrainingDataEntry,
-    },
     game::inputs::{self, SparseInputType, get_num_buckets},
     game::outputs,
     nn::optimiser,
@@ -114,13 +110,15 @@ fn find_latest_superbatch(net_id: &str, output_dir: &str) -> usize {
     if max_sb == 0 { 1 } else { max_sb + 1 }
 }
 
-fn filter(entry: &TrainingDataEntry) -> bool {
-    entry.ply >= 16
-        && !entry.pos.is_checked(entry.pos.side_to_move())
-        && entry.score.unsigned_abs() <= 12_000
-        && entry.mv.mtype() == MoveType::Normal
-        && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
-}
+// No filtering: every position in the binpack is trained on as-is. The
+// old quiet-position filter (skip captures/checks/opening plies/forced
+// mates) predates the threat-input features above -- now that the net
+// sees attacker/victim relationships directly, tactical positions
+// (captures, checks) are exactly the ones those features are meant to
+// help with, so dropping them was working against the new inputs. This
+// also removes the raw-count-vs-filtered-yield mismatch that made
+// `count_positions`/`superbatches_for_positions` size the schedule off
+// a number that didn't match what the loader actually trained on.
 
 // Known exact position counts, keyed by binpack basename (not full path,
 // so this table survives moving files between /kaggle/input/... mounts
@@ -748,7 +746,9 @@ fn main() {
         batch_queue_size: 64,
     };
 
-    let data_loader = loader::SfBinpackLoader::new(file_path, 512, 2, filter);
+    // No filter: `SfBinpackLoader` still takes a filter closure, so pass
+    // one that accepts every entry unchanged.
+    let data_loader = loader::SfBinpackLoader::new(file_path, 512, 2, |_| true);
 
     trainer.run(&schedule, &settings, &data_loader);
 
