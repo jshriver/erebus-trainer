@@ -91,6 +91,383 @@ fn total_planned_superbatches() -> usize {
     (total_batches / BATCHES_PER_SUPERBATCH).max(1)
 }
 
+// ============================================================
+// checkpoint_validation -- guards against bullet_lib silently writing,
+// and this trainer later resuming from, a dead / all-zero checkpoint.
+//
+// ROOT CAUSE this addresses (the "engine evaluates every position as a
+// constant ~47" bug):
+//
+//   * bullet_lib's save path -- crates/bullet_lib/src/value/save.rs
+//     `save_to_checkpoint` -- writes `raw.bin` and `quantised.bin` like
+//     this:
+//         if let Err(e) = save_unquantised(...) { println!("{e}"); }
+//         if let Err(e) = save_quantised(...)   { println!("{e}"); }
+//     The write errors are only *printed*; they are never returned.
+//     `trainer.run()` then unconditionally prints "Saved [erebus-N]".
+//     A missing, truncated, or all-zero weight file is therefore
+//     indistinguishable, to everything downstream, from a good save.
+//
+//   * The old `find_latest_superbatch` chose the resume point purely by
+//     parsing the trailing number off each directory name and taking
+//     the max -- it never opened a single file. So the highest-numbered
+//     directory always won, even when its `raw.bin` / `quantised.bin`
+//     were zero-length or all zeros. `load_from_checkpoint` would then
+//     resume the run (and hence every later checkpoint) from that dead
+//     `optimiser_state`, and the engine would load an all-zero
+//     `quantised.bin` and return a constant evaluation.
+//
+// The smallest correct fix that stays in this repo (patching the
+// `~/.cargo` git checkout of bullet_lib would not survive `cargo
+// update` and is not version-controlled here) is to validate checkpoint
+// *contents* at the two points this trainer controls:
+//   1. at resume time  -- invalid directories are moved aside, never
+//      chosen (`find_latest_superbatch`).
+//   2. immediately after `trainer.run()` returns -- a bad save makes the
+//      process exit non-zero instead of looking successful
+//      (`validate_session_checkpoints`), so a failed save can never be
+//      picked up as "the latest usable checkpoint" on the next run.
+// ============================================================
+mod checkpoint_validation {
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
+
+    /// Fraction of sampled weight slots that must be non-zero for a file
+    /// to count as "a real network". A freshly initialised bullet net is
+    /// ~100% non-zero (random init) and only grows from there; a
+    /// dead/zeroed checkpoint is ~0%. 1% leaves enormous headroom while
+    /// still catching the failure unambiguously.
+    const MIN_NONZERO_FRACTION: f64 = 0.01;
+
+    /// How the whole file is sampled for the non-zero check: SAMPLE_BLOCKS
+    /// evenly spaced windows of BLOCK_BYTES each. Reads a few MiB total
+    /// regardless of file size, and is location-independent so an all-zero
+    /// region anywhere in the file cannot hide behind a non-zero header.
+    const SAMPLE_BLOCKS: usize = 256;
+    const BLOCK_BYTES: usize = 16 * 1024;
+
+    /// Per-tensor element counts, in `save_format` order (see `main`):
+    /// l0w, l0b, l1w, l1b, l2w, l2b, l3w, l3b. Single source of truth for
+    /// both expected file sizes below, derived from the architecture
+    /// constants so it stays correct if those are retuned.
+    fn tensor_elem_counts() -> [usize; 8] {
+        let l1_out = crate::L2_SIZE * crate::OUTPUT_BUCKETS;
+        [
+            crate::COMBINED_INPUTS * crate::L1_SIZE, // l0w
+            crate::L1_SIZE,                          // l0b
+            2 * crate::L1_SIZE * l1_out,             // l1w
+            l1_out,                                  // l1b
+            crate::L2_SIZE * crate::L3_SIZE,         // l2w
+            crate::L3_SIZE,                          // l2b
+            crate::L3_SIZE,                          // l3w
+            1,                                       // l3b
+        ]
+    }
+
+    /// `raw.bin` is every tensor written back-to-back as `f32`, with no
+    /// header and no padding (bullet_lib `value/save.rs::save_unquantised`),
+    /// so its length on disk is exactly known.
+    fn expected_raw_bytes() -> u64 {
+        tensor_elem_counts().iter().sum::<usize>() as u64 * 4
+    }
+
+    /// `quantised.bin` writes l0w/l0b/l1w/l1b as `i16` and l2w/l2b/l3w/l3b
+    /// as `f32`, then pads with 0..=63 bytes of "bullet" to a 64-byte
+    /// multiple (bullet_lib `model/weights.rs::to_quantised_buffer`), so
+    /// only a lower bound on its length is known.
+    fn min_quantised_bytes() -> u64 {
+        let c = tensor_elem_counts();
+        let i16_bytes = (c[0] + c[1] + c[2] + c[3]) as u64 * 2;
+        let f32_bytes = (c[4] + c[5] + c[6] + c[7]) as u64 * 4;
+        i16_bytes + f32_bytes
+    }
+
+    /// Sample evenly spaced windows across the whole file and return the
+    /// fraction of `elem_bytes`-sized slots that contain at least one
+    /// non-zero byte. A zero `f32` and a zero `i16` are both all-zero
+    /// bytes, so this works for `raw.bin` (elem_bytes = 4) and
+    /// `quantised.bin` (elem_bytes = 2) without knowing the dtype.
+    fn sampled_nonzero_fraction(path: &Path, elem_bytes: usize) -> std::io::Result<f64> {
+        let mut file = fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(0.0);
+        }
+
+        let block = BLOCK_BYTES.min(len as usize);
+        let span = len - block as u64;
+        let mut buf = vec![0u8; block];
+
+        let mut nonzero = 0u64;
+        let mut total = 0u64;
+        for i in 0..SAMPLE_BLOCKS {
+            let start = if SAMPLE_BLOCKS <= 1 { 0 } else { span * i as u64 / (SAMPLE_BLOCKS as u64 - 1) };
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut buf)?;
+            for chunk in buf.chunks_exact(elem_bytes) {
+                total += 1;
+                if chunk.iter().any(|&b| b != 0) {
+                    nonzero += 1;
+                }
+            }
+        }
+
+        Ok(if total == 0 { 0.0 } else { nonzero as f64 / total as f64 })
+    }
+
+    /// Structural + content check on one exported weight file.
+    /// `exact_bytes` is `Some` when the on-disk length is fully determined
+    /// (`raw.bin`); otherwise `min_bytes` is a hard lower bound
+    /// (`quantised.bin`, which has trailing padding).
+    fn check_weight_file(path: &Path, elem_bytes: usize, min_bytes: u64, exact_bytes: Option<u64>) -> Result<(), String> {
+        if !path.is_file() {
+            return Err(format!("{}: missing (not a regular file)", path.display()));
+        }
+
+        let len = fs::metadata(path).map_err(|e| format!("{}: cannot stat ({e})", path.display()))?.len();
+
+        if len == 0 {
+            return Err(format!("{}: file is empty", path.display()));
+        }
+        if len % elem_bytes as u64 != 0 {
+            return Err(format!(
+                "{}: length {len} is not a multiple of {elem_bytes} bytes -- malformed / truncated mid-value",
+                path.display()
+            ));
+        }
+        if len < min_bytes {
+            return Err(format!(
+                "{}: length {len} is below the {min_bytes} bytes this architecture requires -- truncated",
+                path.display()
+            ));
+        }
+        if let Some(exact) = exact_bytes
+            && len != exact
+        {
+            return Err(format!(
+                "{}: length {len} does not equal the expected {exact} bytes for this architecture -- malformed",
+                path.display()
+            ));
+        }
+
+        let frac = sampled_nonzero_fraction(path, elem_bytes)
+            .map_err(|e| format!("{}: unreadable during validation ({e})", path.display()))?;
+        if frac < MIN_NONZERO_FRACTION {
+            return Err(format!(
+                "{}: only {:.4}% of sampled weights are non-zero (need >= {:.2}%) -- dead / zeroed network",
+                path.display(),
+                frac * 100.0,
+                MIN_NONZERO_FRACTION * 100.0
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_with_expectations(dir: &Path, raw_exact: u64, quant_min: u64) -> Result<(), String> {
+        check_weight_file(&dir.join("raw.bin"), 4, raw_exact, Some(raw_exact))?;
+        check_weight_file(&dir.join("quantised.bin"), 2, quant_min, None)?;
+
+        // `load_from_checkpoint` reloads weights + optimiser momentum from
+        // this subdirectory; if it is gone or empty, resume has nothing to
+        // stand on even when the exported .bin files look fine.
+        let opt = dir.join("optimiser_state");
+        if !opt.is_dir() {
+            return Err(format!(
+                "{}: optimiser_state/ is missing -- resume would have no weights/momentum to load",
+                dir.display()
+            ));
+        }
+        let empty = fs::read_dir(&opt).map(|mut e| e.next().is_none()).unwrap_or(true);
+        if empty {
+            return Err(format!("{}: optimiser_state/ is empty", dir.display()));
+        }
+
+        Ok(())
+    }
+
+    /// `Ok(())` iff `dir` is a checkpoint this trainer can safely resume
+    /// from and ship to the engine: `raw.bin` present and exactly the
+    /// right size and not all-zero, `quantised.bin` present and at least
+    /// the right size and not all-zero, `optimiser_state/` present and
+    /// non-empty. The `Err` string names the file and the exact problem.
+    pub fn validate(dir: &Path) -> Result<(), String> {
+        validate_with_expectations(dir, expected_raw_bytes(), min_quantised_bytes())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+
+        fn scratch(name: &str) -> PathBuf {
+            let mut p = std::env::temp_dir();
+            p.push(format!("erebus_ckpt_test_{}_{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        fn write_nonzero(path: &Path, n: usize) {
+            let mut b = vec![0u8; n];
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i % 251 + 1) as u8; // 1..=251, never zero
+            }
+            fs::write(path, &b).unwrap();
+        }
+
+        #[test]
+        fn nonzero_fraction_all_zero_is_zero() {
+            let d = scratch("frac_zero");
+            let f = d.join("w.bin");
+            fs::write(&f, vec![0u8; 64 * 1024]).unwrap();
+            assert_eq!(sampled_nonzero_fraction(&f, 4).unwrap(), 0.0);
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn nonzero_fraction_all_ones_is_one() {
+            let d = scratch("frac_one");
+            let f = d.join("w.bin");
+            fs::write(&f, vec![0xFFu8; 64 * 1024]).unwrap();
+            assert_eq!(sampled_nonzero_fraction(&f, 4).unwrap(), 1.0);
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn nonzero_fraction_half_and_half() {
+            let d = scratch("frac_half");
+            let f = d.join("w.bin");
+            let mut bytes = Vec::new();
+            for i in 0..8192u32 {
+                if i % 2 == 0 {
+                    bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    bytes.extend_from_slice(&[1, 0, 0, 0]);
+                }
+            }
+            fs::write(&f, &bytes).unwrap();
+            let frac = sampled_nonzero_fraction(&f, 4).unwrap();
+            assert!((frac - 0.5).abs() < 0.05, "expected ~0.5, got {frac}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn weight_file_rejects_all_zero() {
+            let d = scratch("wf_zero");
+            let f = d.join("raw.bin");
+            fs::write(&f, vec![0u8; 4096]).unwrap();
+            let err = check_weight_file(&f, 4, 4096, Some(4096)).unwrap_err();
+            assert!(err.contains("dead / zeroed"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn weight_file_accepts_nonzero_correct_size() {
+            let d = scratch("wf_ok");
+            let f = d.join("raw.bin");
+            write_nonzero(&f, 4096);
+            check_weight_file(&f, 4, 4096, Some(4096)).unwrap();
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn weight_file_rejects_truncated() {
+            let d = scratch("wf_trunc");
+            let f = d.join("raw.bin");
+            write_nonzero(&f, 2048);
+            let err = check_weight_file(&f, 4, 4096, Some(4096)).unwrap_err();
+            assert!(err.contains("truncated") || err.contains("does not equal"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn weight_file_rejects_bad_alignment() {
+            let d = scratch("wf_align");
+            let f = d.join("raw.bin");
+            write_nonzero(&f, 4095);
+            let err = check_weight_file(&f, 4, 4096, Some(4096)).unwrap_err();
+            assert!(err.contains("multiple of 4"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn weight_file_rejects_missing() {
+            let d = scratch("wf_missing");
+            let err = check_weight_file(&d.join("nope.bin"), 4, 8, Some(8)).unwrap_err();
+            assert!(err.contains("missing"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn quantised_allows_trailing_padding() {
+            // min_bytes = 4096, elem 2, no exact bound -> a 4160-byte file
+            // (4096 data + 64 pad) must still pass.
+            let d = scratch("wf_pad");
+            let f = d.join("quantised.bin");
+            write_nonzero(&f, 4160);
+            check_weight_file(&f, 2, 4096, None).unwrap();
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn validate_rejects_missing_optimiser_state() {
+            let d = scratch("v_noopt");
+            write_nonzero(&d.join("raw.bin"), 256);
+            write_nonzero(&d.join("quantised.bin"), 128);
+            let err = validate_with_expectations(&d, 256, 128).unwrap_err();
+            assert!(err.contains("optimiser_state"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn validate_rejects_empty_optimiser_state() {
+            let d = scratch("v_emptyopt");
+            write_nonzero(&d.join("raw.bin"), 256);
+            write_nonzero(&d.join("quantised.bin"), 128);
+            fs::create_dir(d.join("optimiser_state")).unwrap();
+            let err = validate_with_expectations(&d, 256, 128).unwrap_err();
+            assert!(err.contains("empty"), "{err}");
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn validate_accepts_well_formed_checkpoint() {
+            let d = scratch("v_ok");
+            write_nonzero(&d.join("raw.bin"), 256);
+            write_nonzero(&d.join("quantised.bin"), 160);
+            fs::create_dir(d.join("optimiser_state")).unwrap();
+            write_nonzero(&d.join("optimiser_state").join("weights.bin"), 64);
+            validate_with_expectations(&d, 256, 128).unwrap();
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+}
+
+/// Move a bad checkpoint directory aside to `<name>.invalid[.N]` so it is
+/// never re-selected on resume. Renaming (rather than deleting) keeps the
+/// evidence around for debugging and means a false positive in validation
+/// can't silently destroy a run.
+fn quarantine_checkpoint(path: &Path) {
+    let base = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    for n in 0.. {
+        let cand =
+            if n == 0 { path.with_file_name(format!("{base}.invalid")) } else { path.with_file_name(format!("{base}.invalid.{n}")) };
+        if cand.exists() {
+            continue;
+        }
+        match fs::rename(path, &cand) {
+            Ok(()) => eprintln!("  -> moved aside to {}", cand.display()),
+            Err(e) => eprintln!(
+                "  -> WARNING: could not move {} aside ({e}); it will keep being skipped on resume",
+                path.display()
+            ),
+        }
+        return;
+    }
+}
+
 fn find_latest_superbatch(net_id: &str, output_dir: &str) -> usize {
     let base = Path::new(output_dir);
     if !base.exists() {
@@ -99,15 +476,89 @@ fn find_latest_superbatch(net_id: &str, output_dir: &str) -> usize {
     let mut max_sb = 0usize;
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
+            let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = name.strip_prefix(&format!("{}-", net_id)) {
-                if let Ok(num) = rest.parse::<usize>() {
-                    max_sb = max_sb.max(num);
+            let Some(rest) = name.strip_prefix(&format!("{}-", net_id)) else { continue };
+            let Ok(num) = rest.parse::<usize>() else { continue };
+            if !path.is_dir() {
+                continue;
+            }
+            match checkpoint_validation::validate(&path) {
+                Ok(()) => max_sb = max_sb.max(num),
+                Err(reason) => {
+                    eprintln!("Ignoring invalid checkpoint {}:", path.display());
+                    eprintln!("  {reason}");
+                    quarantine_checkpoint(&path);
                 }
             }
         }
     }
     if max_sb == 0 { 1 } else { max_sb + 1 }
+}
+
+/// Validate every checkpoint this session was supposed to write. bullet_lib
+/// swallows weight-file write errors and `trainer.run()` reports "Saved
+/// [...]" regardless, so this is the only place a truncated / missing /
+/// all-zero save is caught before the process exits 0 (which the outer
+/// driver script treats as "this chunk is done, resume from here next
+/// time"). Any failure quarantines the bad directory and exits non-zero.
+fn validate_session_checkpoints(net_id: &str, output_dir: &str, start_superbatch: usize, end_superbatch: usize, save_rate: usize) {
+    // Matches bullet_lib's own save predicate in value.rs::run:
+    //   superbatch % save_rate == 0 || superbatch == final_superbatch
+    let expected: Vec<usize> = (start_superbatch..=end_superbatch)
+        .filter(|sb| save_rate == 0 || sb % save_rate == 0 || *sb == end_superbatch)
+        .collect();
+
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for sb in expected {
+        let path = Path::new(output_dir).join(format!("{net_id}-{sb}"));
+        let result = if path.is_dir() {
+            checkpoint_validation::validate(&path)
+        } else {
+            Err(format!("{}: checkpoint directory was never created by the save path", path.display()))
+        };
+        match result {
+            Ok(()) => valid.push(sb),
+            Err(reason) => invalid.push((sb, path, reason)),
+        }
+    }
+
+    if invalid.is_empty() {
+        println!();
+        println!(
+            "Checkpoint validation: all {} checkpoint(s) this session are valid \
+             (raw.bin exact-size & non-zero, quantised.bin non-zero, optimiser_state present).",
+            valid.len()
+        );
+        return;
+    }
+
+    eprintln!();
+    eprintln!("==================== CHECKPOINT VALIDATION FAILED ====================");
+    eprintln!(
+        "bullet_lib reported these saves as successful, but {} of {} checkpoint(s) this",
+        invalid.len(),
+        invalid.len() + valid.len()
+    );
+    eprintln!("session are unusable:");
+    for (sb, path, reason) in &invalid {
+        eprintln!("  [{net_id}-{sb}] {reason}");
+        quarantine_checkpoint(path);
+    }
+    eprintln!();
+    if valid.is_empty() {
+        eprintln!("NO valid checkpoint was produced this session. Do not resume from this run --");
+        eprintln!("the last usable checkpoint is whatever validated on a previous run.");
+    } else {
+        eprintln!(
+            "Checkpoints that DID validate this session: {}.",
+            valid.iter().map(|sb| format!("{net_id}-{sb}")).collect::<Vec<_>>().join(", ")
+        );
+        eprintln!("The bad directories above were moved to *.invalid so resume ignores them.");
+    }
+    eprintln!("====================================================================");
+    std::process::exit(1);
 }
 
 // No filtering: every position in the binpack is trained on as-is. The
@@ -601,6 +1052,10 @@ fn main() {
     let net_id = "erebus";
     let output_dir = "checkpoints";
 
+    if !Path::new(output_dir).exists() {
+        fs::create_dir_all(output_dir).expect("Could not create output directory");
+    }
+
     let start_superbatch = find_latest_superbatch(net_id, output_dir);
     let position_count = count_positions(file_path);
     let superbatches_this_session = superbatches_for_positions(position_count, passes);
@@ -751,6 +1206,14 @@ fn main() {
     let data_loader = loader::SfBinpackLoader::new(file_path, 512, 2, |_| true);
 
     trainer.run(&schedule, &settings, &data_loader);
+
+    // bullet_lib's save path only *prints* weight-file write errors and
+    // `trainer.run()` reports "Saved [...]" regardless -- so validate every
+    // checkpoint this session actually produced before we let the process
+    // exit 0. A truncated / missing / all-zero save quarantines the bad
+    // directory and exits non-zero here, so it can never be picked up as
+    // "the latest usable checkpoint" on the next run.
+    validate_session_checkpoints(net_id, output_dir, start_superbatch, end_superbatch, schedule.save_rate);
 
     println!();
     println!("Done this session. Checkpoints saved to: {}", output_dir);

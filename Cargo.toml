@@ -1,12 +1,13 @@
 [package]
-name = "bullet_trainer"
+name = "erebus-trainer"
 version = "2.0.1"
 edition = "2024"
 
 [dependencies.bullet_lib]
 git = "https://github.com/jw1912/bullet.git"
 default-features = false
-features = ["cuda"]
+# CPU-only build: this environment does not have a CUDA toolkit installed.
+# Enable the `cuda` feature only on machines with NVIDIA GPU support.
 
 [dependencies]
 bulletformat = "1.8.0"
