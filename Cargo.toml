@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies.bullet_lib]
 git = "https://github.com/jw1912/bullet.git"
 default-features = false
-# CPU-only build: this environment does not have a CUDA toolkit installed.
-# Enable the `cuda` feature only on machines with NVIDIA GPU support.
+# Requires an NVIDIA GPU + CUDA toolkit at build time. On a CPU-only box
+# this fails to compile; drop `features` back to `[]` there to get the
+# MockGPU runtime (builds, but can't train).
+features = ["cuda"]
 
 [dependencies]
 bulletformat = "1.8.0"
